@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ConnectionState } from '../types';
-import { Copy, Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, Link as LinkIcon, AlertTriangle, Network, Loader2 } from 'lucide-react';
+import { Copy, Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, Link as LinkIcon, AlertTriangle, Network, Loader2, Signal } from 'lucide-react';
 
+// Extensive list of free public STUN servers to help punch through VPNs/NATs
 const SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -9,7 +10,12 @@ const SERVERS = {
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
+    { urls: 'stun:stun.services.mozilla.com' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+    { urls: 'stun:stun.qq.com:3478' },
+    { urls: 'stun:stun.miwifi.com:3478' },
   ],
+  iceCandidatePoolSize: 10,
 };
 
 const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
@@ -24,6 +30,9 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [mediaReady, setMediaReady] = useState(false);
   const [mediaError, setMediaError] = useState<string>('');
   const [gatheringIce, setGatheringIce] = useState(false);
+  
+  // State to hold the remote stream to avoid race conditions with DOM rendering
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -48,6 +57,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     startMedia();
 
     return () => {
+      // Cleanup tracks
       if (localStream.current) {
         localStream.current.getTracks().forEach(track => track.stop());
       }
@@ -57,13 +67,25 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     };
   }, []);
 
+  // Effect: Attach Remote Stream to Video Element whenever it becomes available
+  // This fixes the race condition where 'ontrack' fires before the <video> element exists in the DOM.
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStream) {
+      console.log("Attaching remote stream to video element", remoteStream.getTracks());
+      remoteVideoRef.current.srcObject = remoteStream;
+      
+      // Force play attempt
+      remoteVideoRef.current.play().catch(e => console.error("Auto-play prevented:", e));
+    }
+  }, [remoteStream, connectionState]); // Re-run if stream changes or view layout changes
+
   const createPeerConnection = () => {
     if (peerConnection.current) return peerConnection.current;
 
+    console.log("Creating RTCPeerConnection");
     const pc = new RTCPeerConnection(SERVERS);
 
     // CRITICAL FIX: Add Transceivers to force bidirectional media
-    // This ensures that even if tracks are added late, the SDP offers to SEND and RECEIVE.
     pc.addTransceiver('audio', { direction: 'sendrecv' });
     pc.addTransceiver('video', { direction: 'sendrecv' });
 
@@ -76,37 +98,37 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
 
     // Handle remote tracks
     pc.ontrack = (event) => {
-      console.log("Remote track received", event.streams);
-      const remoteVideo = remoteVideoRef.current;
-      if (remoteVideo) {
-        // Fallback: If event.streams[0] is missing (rare but happens), create a new stream
-        if (event.streams && event.streams[0]) {
-          remoteVideo.srcObject = event.streams[0];
-        } else {
-          let inboundStream = new MediaStream();
-          inboundStream.addTrack(event.track);
-          remoteVideo.srcObject = inboundStream;
-        }
+      console.log("REMOTE TRACK RECEIVED:", event.streams);
+      if (event.streams && event.streams[0]) {
+        setRemoteStream(event.streams[0]);
+      } else {
+        // Fallback for some browsers that don't group tracks into streams automatically
+        const newStream = new MediaStream();
+        newStream.addTrack(event.track);
+        setRemoteStream(newStream);
       }
     };
 
     pc.onconnectionstatechange = () => {
+      console.log("Connection State:", pc.connectionState);
       if (pc.connectionState === 'connected') setConnectionState(ConnectionState.CONNECTED);
       else if (pc.connectionState === 'failed') setConnectionState(ConnectionState.FAILED);
     };
 
     pc.oniceconnectionstatechange = () => {
+      console.log("ICE State:", pc.iceConnectionState);
       setIceStatus(pc.iceConnectionState);
     };
 
     pc.onicecandidate = (event) => {
       if (event.candidate === null) {
-        // Gathering complete
+        // Gathering complete - this is when we generate the code
+        console.log("ICE Gathering Complete");
         const offerOrAnswer = pc.localDescription;
         if (offerOrAnswer) {
           const code = btoa(JSON.stringify(offerOrAnswer));
           setGeneratedCode(code);
-          setGatheringIce(false); // Stop loading spinner
+          setGatheringIce(false); 
         }
       }
     };
@@ -121,9 +143,13 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     setConnectionState(ConnectionState.CREATING_OFFER);
     setGatheringIce(true);
     
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    // Now we wait for onicecandidate to return null (gathering complete)
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+    } catch (e) {
+      console.error("Error creating offer:", e);
+      setGatheringIce(false);
+    }
   };
 
   const joinAsGuest = async () => {
@@ -139,22 +165,23 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       const decoded = atob(remoteCodeInput);
       const remoteDesc = JSON.parse(decoded);
 
+      console.log("Setting Remote Description:", remoteDesc.type);
       await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
 
       if (pc.remoteDescription?.type === 'offer') {
         // We are the Guest, generating an Answer
-        setConnectionState(ConnectionState.WAITING_FOR_ANSWER); // Re-use this state for display
+        setConnectionState(ConnectionState.WAITING_FOR_ANSWER);
         setGatheringIce(true);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        // Wait for ICE gathering to finish before showing code
       } else if (pc.remoteDescription?.type === 'answer') {
         // We are the Host, connection should start
+        console.log("Answer received, connection established!");
         setConnectionState(ConnectionState.CONNECTED);
       }
     } catch (e) {
       console.error("Invalid code", e);
-      alert("Invalid connection code.");
+      alert("Invalid connection code. Please check and try again.");
     }
   };
 
@@ -170,7 +197,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     setTimeout(() => setLinkCopied(false), 2000);
   };
 
-  // ROBUST TOGGLE LOGIC
+  // Toggle Media Tracks directly on the stream
   const toggleMic = () => {
     const newState = !micOn;
     setMicOn(newState);
@@ -187,8 +214,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     }
   };
 
-  const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-  const isVPNIssue = iceStatus === 'disconnected' || iceStatus === 'failed';
+  const isVPNIssue = iceStatus === 'disconnected' || iceStatus === 'failed' || iceStatus === 'closed';
 
   return (
     <div className="flex flex-col h-full bg-slate-900 text-white relative overflow-hidden">
@@ -201,11 +227,12 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
              <h2 className="text-lg font-semibold tracking-wide">
                 {connectionState === ConnectionState.CONNECTED ? 'Secure Call' : 'Setup Connection'}
             </h2>
-            {connectionState === ConnectionState.CONNECTED && (
+            {/* Extended Status Monitor */}
+            {(connectionState === ConnectionState.CONNECTED || iceStatus !== 'new') && (
                  <div className="flex items-center gap-1.5 mt-1">
-                    <div className={`w-2 h-2 rounded-full ${isVPNIssue ? 'bg-red-500 animate-pulse' : 'bg-green-500'}`} />
+                    <div className={`w-2 h-2 rounded-full ${iceStatus === 'connected' || iceStatus === 'completed' ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'}`} />
                     <span className="text-[10px] uppercase tracking-wider text-slate-400 font-medium">
-                        {isVPNIssue ? 'Network Unstable' : 'Encrypted P2P'}
+                        Status: {iceStatus}
                     </span>
                  </div>
             )}
@@ -231,11 +258,23 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
               <div className="absolute bottom-4 left-4 bg-black/50 px-3 py-1 rounded-full text-sm backdrop-blur-md">
                 Remote
               </div>
+              
+              {/* Debug overlay for black screen issues */}
+              {!remoteStream && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+                   <div className="text-center">
+                     <Loader2 className="w-10 h-10 text-teal-500 animate-spin mx-auto mb-2" />
+                     <p className="text-slate-400">Waiting for video data...</p>
+                   </div>
+                </div>
+              )}
+
               {isVPNIssue && (
-                 <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-center p-6">
+                 <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center text-center p-6 z-20">
                     <Network className="w-12 h-12 text-red-500 mb-4" />
                     <h3 className="text-xl font-bold text-white mb-2">Connection Blocked</h3>
-                    <p className="text-slate-300 max-w-sm">Try disabling your VPN.</p>
+                    <p className="text-slate-300 max-w-sm mb-4">Your VPN might be blocking the video packets.</p>
+                    <p className="text-xs text-slate-500">ICE State: {iceStatus}</p>
                  </div>
               )}
              </div>
@@ -299,7 +338,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                 <div className="flex flex-col items-center animate-pulse">
                   <RefreshCw className="w-10 h-10 text-teal-400 mb-4 animate-spin" />
                   <p className="text-lg">Creating secure handshake...</p>
-                  <p className="text-xs text-slate-500 mt-2">This may take 10-20 seconds with VPNs.</p>
+                  <p className="text-xs text-slate-500 mt-2">This may take up to 30s with VPNs.</p>
                 </div>
               )}
 
