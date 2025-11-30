@@ -1,0 +1,8 @@
+{
+  "name": "Bridge - Private Family Link",
+  "description": "A serverless, secure video connection tool for families separated by distance and internet restrictions. Features manual P2P signaling and Gemini-powered connection testing.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
