@@ -2,8 +2,8 @@ import React, { useEffect, useRef, useState } from 'react';
 import { ConnectionState } from '../types';
 import { Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, AlertTriangle, Network, Loader2, Info, Play, ShieldCheck } from 'lucide-react';
 
-// VERSION TRACKER - Check this footer on your device to confirm deployment
-const APP_VERSION = "v0.8.5 (Stream Accumulator)";
+// VERSION 1.0.0 - FINAL FIX FOR GHOST TRACKS
+const APP_VERSION = "v1.0.0 (FINAL)";
 
 // Extensive list of free public STUN servers
 const SERVERS = {
@@ -33,6 +33,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [debugStats, setDebugStats] = useState<string>('Initializing...');
   const [showStats, setShowStats] = useState(false);
   const [manualPlayNeeded, setManualPlayNeeded] = useState(false);
+  const [isZeroBytes, setIsZeroBytes] = useState(false);
 
   // References
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -41,13 +42,14 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const localStream = useRef<MediaStream | null>(null);
   
   // CRITICAL: Persistent Remote Stream Accumulator
-  // We don't rely on the event.streams[0] to be correct. We build our own.
   const remoteStreamAccumulator = useRef<MediaStream>(new MediaStream());
 
   const statsInterval = useRef<number | null>(null);
 
   // Initialize Local Media
   useEffect(() => {
+    console.log(`%c BRIDGE APP LOADED: ${APP_VERSION}`, 'background: #dc2626; color: white; padding: 4px; border-radius: 4px;');
+    
     const startMedia = async () => {
       try {
         console.log(`[${APP_VERSION}] Requesting user media...`);
@@ -96,6 +98,13 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
            }
         });
 
+        // Check for "Connected but 0 bytes" (VPN Block or Ghost Track)
+        if (peerConnection.current.iceConnectionState === 'connected' && bytesReceived === 0) {
+           setIsZeroBytes(true);
+        } else {
+           setIsZeroBytes(false);
+        }
+
         // 2. Check Track Status
         const videoTracks = remoteStreamAccumulator.current.getVideoTracks();
         const audioTracks = remoteStreamAccumulator.current.getAudioTracks();
@@ -118,9 +127,8 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     console.log(`[${APP_VERSION}] Creating RTCPeerConnection`);
     const pc = new RTCPeerConnection(SERVERS);
 
-    // Force Transceivers to ensure SDP allocates space for video even if stream is late
-    pc.addTransceiver('audio', { direction: 'sendrecv' });
-    pc.addTransceiver('video', { direction: 'sendrecv' });
+    // FIX: Removed manual addTransceiver calls to prevent duplicate m-lines (Ghost Tracks)
+    // We rely solely on addTrack to create the correct transceivers.
 
     // Add local tracks
     if (localStream.current) {
@@ -138,6 +146,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
 
       // Force attachment to DOM
       if (remoteVideoRef.current) {
+        // Important: Re-assign srcObject to trigger browser update if it was just audio before
         remoteVideoRef.current.srcObject = remoteStreamAccumulator.current;
         
         // Attempt play
@@ -265,7 +274,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     }
   };
 
-  const isVPNIssue = iceStatus === 'disconnected' || iceStatus === 'failed' || iceStatus === 'closed';
+  const isVPNIssue = iceStatus === 'disconnected' || iceStatus === 'failed' || iceStatus === 'closed' || isZeroBytes;
 
   return (
     <div className="flex flex-col h-full bg-slate-900 text-white relative overflow-hidden">
@@ -332,11 +341,19 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
               </div>
               
               {isVPNIssue && (
-                 <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center text-center p-6 z-20">
+                 <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-center p-6 z-20 pointer-events-none">
                     <Network className="w-12 h-12 text-red-500 mb-4" />
-                    <h3 className="text-xl font-bold text-white mb-2">Connection Blocked</h3>
-                    <p className="text-slate-300 max-w-sm mb-4">VPN or Firewall is blocking video packets.</p>
-                    <p className="text-xs text-slate-500 font-mono">Status: {iceStatus}</p>
+                    <h3 className="text-xl font-bold text-white mb-2">
+                        {isZeroBytes ? "No Data Received" : "Connection Blocked"}
+                    </h3>
+                    <p className="text-slate-300 max-w-sm mb-4">
+                         {isZeroBytes 
+                            ? "Connected, but video is not flowing. The network might be blocking UDP packets." 
+                            : "VPN or Firewall is blocking video packets."}
+                    </p>
+                    <p className="text-xs text-slate-500 font-mono">
+                        ICE: {iceStatus} | Rx: 0 KB
+                    </p>
                  </div>
               )}
              </div>
@@ -461,9 +478,9 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
         </div>
       </div>
 
-      {/* Footer Version Info */}
-      <div className="absolute bottom-0 w-full text-center p-1 pointer-events-none z-0">
-        <span className="text-[10px] text-slate-700">{APP_VERSION}</span>
+      {/* HIGH VISIBILITY DEBUG FOOTER */}
+      <div className="absolute bottom-0 w-full text-center p-2 z-50 bg-red-600 pointer-events-none">
+        <span className="text-sm font-bold text-white tracking-widest">{APP_VERSION}</span>
       </div>
 
       {/* Controls */}
