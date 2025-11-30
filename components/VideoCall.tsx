@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ConnectionState } from '../types';
-import { Copy, Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, Link as LinkIcon, AlertTriangle, Network, Loader2, Signal } from 'lucide-react';
+import { Copy, Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, Link as LinkIcon, AlertTriangle, Network, Loader2, Info } from 'lucide-react';
 
 // Extensive list of free public STUN servers to help punch through VPNs/NATs
 const SERVERS = {
@@ -30,14 +30,17 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [mediaReady, setMediaReady] = useState(false);
   const [mediaError, setMediaError] = useState<string>('');
   const [gatheringIce, setGatheringIce] = useState(false);
+  const [debugStats, setDebugStats] = useState<string>('Waiting for data...');
+  const [showStats, setShowStats] = useState(false);
   
-  // State to hold the remote stream to avoid race conditions with DOM rendering
+  // State to hold the remote stream
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const peerConnection = useRef<RTCPeerConnection | null>(null);
   const localStream = useRef<MediaStream | null>(null);
+  const statsInterval = useRef<number | null>(null);
 
   // Initialize Media
   useEffect(() => {
@@ -57,27 +60,50 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     startMedia();
 
     return () => {
-      // Cleanup tracks
+      // Cleanup
       if (localStream.current) {
         localStream.current.getTracks().forEach(track => track.stop());
       }
       if (peerConnection.current) {
         peerConnection.current.close();
       }
+      if (statsInterval.current) {
+        window.clearInterval(statsInterval.current);
+      }
     };
   }, []);
 
-  // Effect: Attach Remote Stream to Video Element whenever it becomes available
-  // This fixes the race condition where 'ontrack' fires before the <video> element exists in the DOM.
+  // Monitor Connection Stats (Bytes Received) to debug Black Screen
+  useEffect(() => {
+    if (connectionState === ConnectionState.CONNECTED) {
+      statsInterval.current = window.setInterval(async () => {
+        if (!peerConnection.current) return;
+        const stats = await peerConnection.current.getStats();
+        let activeCandidate = '';
+        let bytesReceived = 0;
+        
+        stats.forEach(report => {
+           if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+              activeCandidate = `Pair: ${report.localCandidateId} <-> ${report.remoteCandidateId}`;
+           }
+           if (report.type === 'inbound-rtp' && (report.kind === 'video' || report.mediaType === 'video')) {
+              bytesReceived = report.bytesReceived;
+           }
+        });
+
+        setDebugStats(`ICE: ${peerConnection.current.iceConnectionState} | Video Bytes: ${(bytesReceived / 1024).toFixed(0)} KB`);
+      }, 2000);
+    }
+  }, [connectionState]);
+
+  // Handle attaching remote stream safely
   useEffect(() => {
     if (remoteVideoRef.current && remoteStream) {
-      console.log("Attaching remote stream to video element", remoteStream.getTracks());
+      console.log("Updating remote video element source", remoteStream.getTracks());
       remoteVideoRef.current.srcObject = remoteStream;
-      
-      // Force play attempt
-      remoteVideoRef.current.play().catch(e => console.error("Auto-play prevented:", e));
+      remoteVideoRef.current.play().catch(e => console.error("Auto-play error", e));
     }
-  }, [remoteStream, connectionState]); // Re-run if stream changes or view layout changes
+  }, [remoteStream, connectionState]);
 
   const createPeerConnection = () => {
     if (peerConnection.current) return peerConnection.current;
@@ -96,33 +122,45 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       });
     }
 
-    // Handle remote tracks
+    // CRITICAL FIX: Robust Track Handling
+    // Instead of replacing the stream, we make sure we are adding to the existing one if needed
     pc.ontrack = (event) => {
-      console.log("REMOTE TRACK RECEIVED:", event.streams);
+      console.log("REMOTE TRACK ARRIVED:", event.track.kind, event.streams);
+      
+      // Use the browser-provided stream if available (most reliable)
       if (event.streams && event.streams[0]) {
-        setRemoteStream(event.streams[0]);
+        const stream = event.streams[0];
+        
+        // Listen for future tracks adding to this stream (e.g. video comes 1s after audio)
+        stream.onaddtrack = () => {
+           console.log("Track added to existing remote stream");
+           // Force React update by creating a shallow copy/new reference if needed
+           // But usually just re-setting state is enough
+           setRemoteStream(stream); 
+        };
+
+        setRemoteStream(stream);
       } else {
-        // Fallback for some browsers that don't group tracks into streams automatically
-        const newStream = new MediaStream();
-        newStream.addTrack(event.track);
-        setRemoteStream(newStream);
+        // Fallback: Manually build stream (rarely needed in modern browsers but good for safety)
+        setRemoteStream(prev => {
+           const newStream = prev ? prev : new MediaStream();
+           newStream.addTrack(event.track);
+           return newStream;
+        });
       }
     };
 
     pc.onconnectionstatechange = () => {
-      console.log("Connection State:", pc.connectionState);
       if (pc.connectionState === 'connected') setConnectionState(ConnectionState.CONNECTED);
       else if (pc.connectionState === 'failed') setConnectionState(ConnectionState.FAILED);
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log("ICE State:", pc.iceConnectionState);
       setIceStatus(pc.iceConnectionState);
     };
 
     pc.onicecandidate = (event) => {
       if (event.candidate === null) {
-        // Gathering complete - this is when we generate the code
         console.log("ICE Gathering Complete");
         const offerOrAnswer = pc.localDescription;
         if (offerOrAnswer) {
@@ -165,23 +203,19 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       const decoded = atob(remoteCodeInput);
       const remoteDesc = JSON.parse(decoded);
 
-      console.log("Setting Remote Description:", remoteDesc.type);
       await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
 
       if (pc.remoteDescription?.type === 'offer') {
-        // We are the Guest, generating an Answer
         setConnectionState(ConnectionState.WAITING_FOR_ANSWER);
         setGatheringIce(true);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
       } else if (pc.remoteDescription?.type === 'answer') {
-        // We are the Host, connection should start
-        console.log("Answer received, connection established!");
         setConnectionState(ConnectionState.CONNECTED);
       }
     } catch (e) {
       console.error("Invalid code", e);
-      alert("Invalid connection code. Please check and try again.");
+      alert("Invalid connection code.");
     }
   };
 
@@ -197,20 +231,42 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     setTimeout(() => setLinkCopied(false), 2000);
   };
 
-  // Toggle Media Tracks directly on the stream
+  // CRITICAL FIX: Toggle Media Tracks on BOTH local preview AND network sender
   const toggleMic = () => {
     const newState = !micOn;
     setMicOn(newState);
+    
+    // 1. Local Preview
     if (localStream.current) {
       localStream.current.getAudioTracks().forEach(t => t.enabled = newState);
+    }
+    
+    // 2. Active Connection
+    if (peerConnection.current) {
+      const senders = peerConnection.current.getSenders();
+      const audioSender = senders.find(s => s.track?.kind === 'audio');
+      if (audioSender && audioSender.track) {
+        audioSender.track.enabled = newState;
+      }
     }
   };
 
   const toggleCam = () => {
     const newState = !cameraOn;
     setCameraOn(newState);
+    
+    // 1. Local Preview
     if (localStream.current) {
       localStream.current.getVideoTracks().forEach(t => t.enabled = newState);
+    }
+
+    // 2. Active Connection
+    if (peerConnection.current) {
+      const senders = peerConnection.current.getSenders();
+      const videoSender = senders.find(s => s.track?.kind === 'video');
+      if (videoSender && videoSender.track) {
+        videoSender.track.enabled = newState;
+      }
     }
   };
 
@@ -227,17 +283,24 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
              <h2 className="text-lg font-semibold tracking-wide">
                 {connectionState === ConnectionState.CONNECTED ? 'Secure Call' : 'Setup Connection'}
             </h2>
-            {/* Extended Status Monitor */}
+            {/* Status Monitor */}
             {(connectionState === ConnectionState.CONNECTED || iceStatus !== 'new') && (
-                 <div className="flex items-center gap-1.5 mt-1">
+                 <div className="flex items-center gap-1.5 mt-1 cursor-pointer" onClick={() => setShowStats(!showStats)}>
                     <div className={`w-2 h-2 rounded-full ${iceStatus === 'connected' || iceStatus === 'completed' ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'}`} />
                     <span className="text-[10px] uppercase tracking-wider text-slate-400 font-medium">
-                        Status: {iceStatus}
+                        {iceStatus}
                     </span>
                  </div>
             )}
         </div>
-        <div className={`w-3 h-3 rounded-full ${connectionState === ConnectionState.CONNECTED ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-yellow-500'}`} />
+        <div className="flex gap-2">
+            {connectionState === ConnectionState.CONNECTED && (
+                <button onClick={() => setShowStats(!showStats)} className="p-2 hover:bg-slate-700 rounded-full text-slate-400">
+                    <Info className="w-5 h-5" />
+                </button>
+            )}
+            <div className={`w-3 h-3 mt-3 mr-2 rounded-full ${connectionState === ConnectionState.CONNECTED ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-yellow-500'}`} />
+        </div>
       </div>
 
       {/* Main Content */}
@@ -246,6 +309,16 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
         {/* Videos Container */}
         <div className={`relative w-full max-w-6xl h-full flex ${connectionState === ConnectionState.CONNECTED ? 'flex-col md:flex-row gap-4' : 'justify-center items-center'}`}>
           
+          {/* Debug Info Overlay */}
+          {showStats && connectionState === ConnectionState.CONNECTED && (
+              <div className="absolute top-4 left-4 z-50 bg-black/80 p-4 rounded-lg text-xs font-mono text-green-400 pointer-events-none border border-green-500/30">
+                  <p>DEBUG METRICS</p>
+                  <p>{debugStats}</p>
+                  <p>Mic Active: {micOn ? 'YES' : 'NO'}</p>
+                  <p>Cam Active: {cameraOn ? 'YES' : 'NO'}</p>
+              </div>
+          )}
+
           {/* Remote Video (Main) */}
           {connectionState === ConnectionState.CONNECTED && (
              <div className="flex-1 bg-black rounded-2xl overflow-hidden shadow-2xl relative border border-slate-700 group">
@@ -312,6 +385,12 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                   <h3 className="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-teal-400 to-blue-500">
                     Secure Peer Connection
                   </h3>
+                  {window.location.hostname === 'localhost' && (
+                     <div className="bg-yellow-500/10 border border-yellow-500/20 p-3 rounded-lg text-yellow-200 text-xs text-left flex gap-2">
+                        <AlertTriangle className="w-4 h-4 shrink-0" />
+                        <p>You are on localhost. Connection will likely fail unless both devices are on the exact same Wi-Fi. Deploy to Vercel/Netlify for remote use.</p>
+                     </div>
+                  )}
                   <div className="grid grid-cols-2 gap-4">
                     <button 
                       onClick={startAsHost}
