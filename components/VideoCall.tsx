@@ -23,6 +23,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [linkCopied, setLinkCopied] = useState(false);
   const [mediaReady, setMediaReady] = useState(false);
   const [mediaError, setMediaError] = useState<string>('');
+  const [gatheringIce, setGatheringIce] = useState(false);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -47,11 +48,9 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     startMedia();
 
     return () => {
-      // Cleanup tracks
       if (localStream.current) {
         localStream.current.getTracks().forEach(track => track.stop());
       }
-      // Cleanup connection
       if (peerConnection.current) {
         peerConnection.current.close();
       }
@@ -59,47 +58,47 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   }, []);
 
   const createPeerConnection = () => {
-    // If a connection already exists, return it.
-    // NOTE: This prevents duplicate connections but we must ensure tracks are added.
     if (peerConnection.current) return peerConnection.current;
 
     const pc = new RTCPeerConnection(SERVERS);
 
-    // CRITICAL: Add local tracks immediately upon creation
-    // We rely on mediaReady state to prevent calling this function before stream exists
+    // CRITICAL FIX: Add Transceivers to force bidirectional media
+    // This ensures that even if tracks are added late, the SDP offers to SEND and RECEIVE.
+    pc.addTransceiver('audio', { direction: 'sendrecv' });
+    pc.addTransceiver('video', { direction: 'sendrecv' });
+
+    // Add local tracks
     if (localStream.current) {
       localStream.current.getTracks().forEach(track => {
         pc.addTrack(track, localStream.current!);
       });
-    } else {
-        console.warn("CreatePeerConnection called without local stream!");
     }
 
     // Handle remote tracks
     pc.ontrack = (event) => {
       console.log("Remote track received", event.streams);
-      if (remoteVideoRef.current && event.streams[0]) {
-        remoteVideoRef.current.srcObject = event.streams[0];
+      const remoteVideo = remoteVideoRef.current;
+      if (remoteVideo) {
+        // Fallback: If event.streams[0] is missing (rare but happens), create a new stream
+        if (event.streams && event.streams[0]) {
+          remoteVideo.srcObject = event.streams[0];
+        } else {
+          let inboundStream = new MediaStream();
+          inboundStream.addTrack(event.track);
+          remoteVideo.srcObject = inboundStream;
+        }
       }
     };
 
-    // Handle connection state changes
     pc.onconnectionstatechange = () => {
-      console.log("Connection State:", pc.connectionState);
-      if (pc.connectionState === 'connected') {
-        setConnectionState(ConnectionState.CONNECTED);
-      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        setConnectionState(ConnectionState.FAILED);
-      }
+      if (pc.connectionState === 'connected') setConnectionState(ConnectionState.CONNECTED);
+      else if (pc.connectionState === 'failed') setConnectionState(ConnectionState.FAILED);
     };
 
-    // Monitor ICE state (VPN Debugging)
     pc.oniceconnectionstatechange = () => {
-        console.log("ICE State:", pc.iceConnectionState);
-        setIceStatus(pc.iceConnectionState);
+      setIceStatus(pc.iceConnectionState);
     };
 
-    // ICE Candidate handling
     pc.onicecandidate = (event) => {
       if (event.candidate === null) {
         // Gathering complete
@@ -107,6 +106,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
         if (offerOrAnswer) {
           const code = btoa(JSON.stringify(offerOrAnswer));
           setGeneratedCode(code);
+          setGatheringIce(false); // Stop loading spinner
         }
       }
     };
@@ -116,21 +116,19 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   };
 
   const startAsHost = async () => {
-    if (!mediaReady) return; // Guard against race condition
+    if (!mediaReady) return;
     const pc = createPeerConnection();
     setConnectionState(ConnectionState.CREATING_OFFER);
+    setGatheringIce(true);
     
-    // Explicitly creating offer with receive audio/video options helps compatibility
-    const offer = await pc.createOffer({
-        offerToReceiveAudio: true,
-        offerToReceiveVideo: true
-    });
+    const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
+    // Now we wait for onicecandidate to return null (gathering complete)
   };
 
   const joinAsGuest = async () => {
-    if (!mediaReady) return; // Guard against race condition
-    createPeerConnection(); // Initialize PC and add tracks
+    if (!mediaReady) return;
+    createPeerConnection(); 
     setConnectionState(ConnectionState.PROCESSING_OFFER);
   };
 
@@ -144,15 +142,19 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
 
       if (pc.remoteDescription?.type === 'offer') {
+        // We are the Guest, generating an Answer
+        setConnectionState(ConnectionState.WAITING_FOR_ANSWER); // Re-use this state for display
+        setGatheringIce(true);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        setConnectionState(ConnectionState.WAITING_FOR_ANSWER);
+        // Wait for ICE gathering to finish before showing code
       } else if (pc.remoteDescription?.type === 'answer') {
+        // We are the Host, connection should start
         setConnectionState(ConnectionState.CONNECTED);
       }
     } catch (e) {
       console.error("Invalid code", e);
-      alert("Invalid connection code. Please check and try again.");
+      alert("Invalid connection code.");
     }
   };
 
@@ -168,41 +170,20 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     setTimeout(() => setLinkCopied(false), 2000);
   };
 
+  // ROBUST TOGGLE LOGIC
   const toggleMic = () => {
     const newState = !micOn;
     setMicOn(newState);
-
-    // 1. Update Local Stream (for UI state consistency)
     if (localStream.current) {
       localStream.current.getAudioTracks().forEach(t => t.enabled = newState);
-    }
-
-    // 2. Update Active Connection Senders (Critical for ensuring remote side stops hearing)
-    if (peerConnection.current) {
-        peerConnection.current.getSenders().forEach(sender => {
-            if (sender.track && sender.track.kind === 'audio') {
-                sender.track.enabled = newState;
-            }
-        });
     }
   };
 
   const toggleCam = () => {
     const newState = !cameraOn;
     setCameraOn(newState);
-
-    // 1. Update Local Stream
     if (localStream.current) {
       localStream.current.getVideoTracks().forEach(t => t.enabled = newState);
-    }
-    
-    // 2. Update Active Connection Senders
-    if (peerConnection.current) {
-        peerConnection.current.getSenders().forEach(sender => {
-            if (sender.track && sender.track.kind === 'video') {
-                sender.track.enabled = newState;
-            }
-        });
     }
   };
 
@@ -229,7 +210,6 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                  </div>
             )}
         </div>
-       
         <div className={`w-3 h-3 rounded-full ${connectionState === ConnectionState.CONNECTED ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-yellow-500'}`} />
       </div>
 
@@ -251,18 +231,11 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
               <div className="absolute bottom-4 left-4 bg-black/50 px-3 py-1 rounded-full text-sm backdrop-blur-md">
                 Remote
               </div>
-              
-              {/* VPN Warning Overlay */}
               {isVPNIssue && (
-                 <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-center p-6 animate-in fade-in">
+                 <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-center p-6">
                     <Network className="w-12 h-12 text-red-500 mb-4" />
                     <h3 className="text-xl font-bold text-white mb-2">Connection Blocked</h3>
-                    <p className="text-slate-300 max-w-sm">
-                        It looks like a Firewall or VPN is blocking the video signal.
-                    </p>
-                    <div className="mt-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-sm text-red-200">
-                        Try disabling your VPN temporarily or switching to a different server location.
-                    </div>
+                    <p className="text-slate-300 max-w-sm">Try disabling your VPN.</p>
                  </div>
               )}
              </div>
@@ -282,24 +255,13 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                  <VideoOff className="w-12 h-12" />
                </div>
              )}
-             
              {!mediaReady && !mediaError && (
                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/50 backdrop-blur-sm z-20">
                     <Loader2 className="w-8 h-8 text-teal-500 animate-spin mb-2" />
                     <p className="text-xs text-teal-400 font-medium">Initializing Camera...</p>
                  </div>
              )}
-             
-             {mediaError && (
-                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-900/80 p-4 text-center">
-                    <AlertTriangle className="w-8 h-8 text-white mb-2" />
-                    <p className="text-xs text-white">{mediaError}</p>
-                 </div>
-             )}
-
-             <div className="absolute bottom-2 left-2 bg-black/50 px-2 py-0.5 rounded-full text-xs backdrop-blur-md">
-                You
-             </div>
+             <div className="absolute bottom-2 left-2 bg-black/50 px-2 py-0.5 rounded-full text-xs backdrop-blur-md">You</div>
           </div>
 
           {/* Setup Wizard Overlay */}
@@ -311,187 +273,109 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                   <h3 className="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-teal-400 to-blue-500">
                     Secure Peer Connection
                   </h3>
-                  <p className="text-slate-400">
-                    No server. No tracking. Just you and your family.
-                  </p>
                   <div className="grid grid-cols-2 gap-4">
                     <button 
                       onClick={startAsHost}
                       disabled={!mediaReady}
-                      className="p-6 bg-slate-800 border border-slate-600 rounded-xl hover:bg-slate-700 hover:border-teal-500 transition-all group flex flex-col items-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="p-6 bg-slate-800 border border-slate-600 rounded-xl hover:bg-slate-700 hover:border-teal-500 transition-all group flex flex-col items-center gap-3 disabled:opacity-50"
                     >
-                      <div className="p-3 bg-teal-500/10 rounded-full group-hover:bg-teal-500/20 text-teal-400">
-                         <Smartphone className="w-8 h-8" />
-                      </div>
-                      <span className="font-semibold">I'm Starting the Call</span>
+                      <Smartphone className="w-8 h-8 text-teal-400" />
+                      <span className="font-semibold">Start Call (Host)</span>
                     </button>
                     <button 
                       onClick={joinAsGuest}
                       disabled={!mediaReady}
-                      className="p-6 bg-slate-800 border border-slate-600 rounded-xl hover:bg-slate-700 hover:border-blue-500 transition-all group flex flex-col items-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="p-6 bg-slate-800 border border-slate-600 rounded-xl hover:bg-slate-700 hover:border-blue-500 transition-all group flex flex-col items-center gap-3 disabled:opacity-50"
                     >
-                       <div className="p-3 bg-blue-500/10 rounded-full group-hover:bg-blue-500/20 text-blue-400">
-                         <Check className="w-8 h-8" />
-                      </div>
-                      <span className="font-semibold">I Have a Code</span>
+                       <Check className="w-8 h-8 text-blue-400" />
+                      <span className="font-semibold">Join Call (Guest)</span>
                     </button>
                   </div>
-                  {!mediaReady && !mediaError && (
-                      <p className="text-xs text-yellow-500 animate-pulse">Waiting for camera access...</p>
-                  )}
                 </div>
               )}
 
-              {/* Host: Generating Offer */}
-              {(connectionState === ConnectionState.CREATING_OFFER && !generatedCode) && (
+              {/* Loading State for ICE Gathering */}
+              {gatheringIce && (
                 <div className="flex flex-col items-center animate-pulse">
                   <RefreshCw className="w-10 h-10 text-teal-400 mb-4 animate-spin" />
-                  <p className="text-lg">Generating secure keys...</p>
+                  <p className="text-lg">Creating secure handshake...</p>
+                  <p className="text-xs text-slate-500 mt-2">This may take 10-20 seconds with VPNs.</p>
                 </div>
               )}
 
-              {/* Host: Display Codes */}
-              {(connectionState === ConnectionState.CREATING_OFFER && generatedCode) && (
+              {/* Host: Display Codes (Only show if code is ready and we aren't gathering) */}
+              {(connectionState === ConnectionState.CREATING_OFFER && generatedCode && !gatheringIce) && (
                 <div className="max-w-md w-full space-y-6 text-left">
-                  <div className="flex items-center gap-2 mb-2">
-                    <h3 className="text-xl font-bold text-teal-400">Invite Your Family</h3>
-                  </div>
-
-                  {isLocal && (
-                    <div className="p-3 bg-yellow-500/20 border border-yellow-500/40 rounded-lg flex items-start gap-3">
-                      <AlertTriangle className="w-5 h-5 text-yellow-500 shrink-0 mt-0.5" />
-                      <div className="text-xs text-yellow-100 space-y-1">
-                        <p><strong>Localhost Detected:</strong> Your link won't work for her if you send it now.</p>
-                        <p>Deploy this app (Netlify, Vercel, etc) first, then share the public link.</p>
-                      </div>
-                    </div>
-                  )}
-
                   <div className="space-y-2">
                     <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Step 1: Send App Link</h4>
                     <div className="flex gap-2">
                       <div className="flex-1 bg-slate-800 border border-slate-600 rounded-md px-3 py-3 text-xs text-slate-400 font-mono truncate">
                         {window.location.href}
                       </div>
-                      <button 
-                        onClick={copyLink}
-                        className={`px-4 rounded-md font-bold text-xs transition flex items-center gap-2 ${linkCopied ? 'bg-green-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-200'}`}
-                      >
-                         {linkCopied ? <Check className="w-3 h-3"/> : <LinkIcon className="w-3 h-3"/>}
-                         {linkCopied ? 'COPIED' : 'COPY'}
-                      </button>
+                      <button onClick={copyLink} className="px-4 bg-slate-700 rounded-md font-bold text-xs">{linkCopied ? 'COPIED' : 'COPY'}</button>
                     </div>
                   </div>
                   
                   <div className="space-y-2">
                     <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Step 2: Send Connection Code</h4>
                     <div className="relative">
-                      <textarea 
-                        readOnly
-                        value={generatedCode}
-                        className="w-full h-24 bg-slate-800 rounded-lg border border-slate-600 p-3 text-xs font-mono focus:outline-none focus:border-teal-500 resize-none text-slate-300"
-                      />
-                      <button 
-                        onClick={copyToClipboard}
-                        className="absolute bottom-3 right-3 p-2 bg-teal-600 hover:bg-teal-500 text-white rounded-md shadow-lg flex items-center gap-2 text-xs font-bold transition"
-                      >
-                        {copied ? <Check className="w-4 h-4"/> : <Copy className="w-4 h-4"/>}
-                        {copied ? "COPIED" : "COPY"}
-                      </button>
+                      <textarea readOnly value={generatedCode} className="w-full h-24 bg-slate-800 rounded-lg border border-slate-600 p-3 text-xs font-mono text-slate-300 resize-none" />
+                      <button onClick={copyToClipboard} className="absolute bottom-3 right-3 p-2 bg-teal-600 text-white rounded-md text-xs font-bold">{copied ? "COPIED" : "COPY"}</button>
                     </div>
                   </div>
 
                   <div className="pt-4 border-t border-slate-700 space-y-3">
-                     <h4 className="text-xs font-bold text-blue-400 uppercase tracking-wider">Step 3: Paste Their Reply Code</h4>
+                     <h4 className="text-xs font-bold text-blue-400 uppercase tracking-wider">Step 3: Paste Their Reply</h4>
                      <textarea 
                       placeholder="Paste the code they send back here..."
                       value={remoteCodeInput}
                       onChange={(e) => setRemoteCodeInput(e.target.value)}
-                      className="w-full h-20 bg-slate-800 rounded-lg border border-slate-600 p-3 text-xs font-mono focus:outline-none focus:border-blue-500 resize-none"
+                      className="w-full h-20 bg-slate-800 rounded-lg border border-slate-600 p-3 text-xs font-mono resize-none"
                     />
-                    <button 
-                      onClick={processRemoteCode}
-                      disabled={!remoteCodeInput}
-                      className="w-full py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-lg transition"
-                    >
-                      Connect Video
-                    </button>
+                    <button onClick={processRemoteCode} disabled={!remoteCodeInput} className="w-full py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold rounded-lg transition">Connect Video</button>
                   </div>
                 </div>
               )}
 
               {/* Guest: Input Offer */}
-              {(connectionState === ConnectionState.PROCESSING_OFFER && !generatedCode) && (
+              {(connectionState === ConnectionState.PROCESSING_OFFER) && (
                  <div className="max-w-md w-full space-y-4">
                   <h3 className="text-xl font-bold text-teal-400">Step 1: Paste Code</h3>
-                  <p className="text-sm text-slate-400">Paste the connection code you received.</p>
                   <textarea 
-                      placeholder="Paste received code here..."
+                      placeholder="Paste the code you received..."
                       value={remoteCodeInput}
                       onChange={(e) => setRemoteCodeInput(e.target.value)}
-                      className="w-full h-32 bg-slate-800 rounded-lg border border-slate-600 p-3 text-xs font-mono focus:outline-none focus:border-teal-500 resize-none"
+                      className="w-full h-32 bg-slate-800 rounded-lg border border-slate-600 p-3 text-xs font-mono resize-none"
                     />
-                    <button 
-                      onClick={processRemoteCode}
-                      disabled={!remoteCodeInput}
-                      className="w-full py-3 bg-teal-600 hover:bg-teal-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-lg transition"
-                    >
-                      Generate Reply Code
-                    </button>
+                    <button onClick={processRemoteCode} disabled={!remoteCodeInput} className="w-full py-3 bg-teal-600 hover:bg-teal-500 disabled:opacity-50 text-white font-bold rounded-lg transition">Generate Reply Code</button>
                  </div>
               )}
 
-              {/* Guest: Output Answer */}
-              {(connectionState === ConnectionState.WAITING_FOR_ANSWER && generatedCode) && (
+              {/* Guest: Output Answer (Only show if code is ready and not gathering) */}
+              {(connectionState === ConnectionState.WAITING_FOR_ANSWER && generatedCode && !gatheringIce) && (
                  <div className="max-w-md w-full space-y-4">
                   <h3 className="text-xl font-bold text-blue-400">Step 2: Send Reply</h3>
-                  <p className="text-sm text-slate-400">Send this reply code back to start the call.</p>
                    <div className="relative">
-                    <textarea 
-                      readOnly
-                      value={generatedCode}
-                      className="w-full h-32 bg-slate-800 rounded-lg border border-slate-600 p-3 text-xs font-mono focus:outline-none focus:border-blue-500 resize-none text-slate-300"
-                    />
-                    <button 
-                      onClick={copyToClipboard}
-                      className="absolute bottom-3 right-3 p-2 bg-blue-600 hover:bg-blue-500 text-white rounded-md shadow-lg flex items-center gap-2 text-xs font-bold transition"
-                    >
-                      {copied ? <Check className="w-4 h-4"/> : <Copy className="w-4 h-4"/>}
-                      {copied ? "COPIED" : "COPY"}
-                    </button>
+                    <textarea readOnly value={generatedCode} className="w-full h-32 bg-slate-800 rounded-lg border border-slate-600 p-3 text-xs font-mono text-slate-300 resize-none" />
+                    <button onClick={copyToClipboard} className="absolute bottom-3 right-3 p-2 bg-blue-600 text-white rounded-md text-xs font-bold">{copied ? "COPIED" : "COPY"}</button>
                   </div>
-                  <p className="text-xs text-slate-500">The video will start automatically once they paste this code.</p>
+                  <p className="text-xs text-slate-500">Send this back to the host.</p>
                  </div>
               )}
-
             </div>
           )}
-
         </div>
       </div>
 
       {/* Controls */}
       <div className="p-6 flex justify-center items-center gap-6 bg-slate-900/90 backdrop-blur z-30 border-t border-slate-800">
-        <button 
-          onClick={toggleMic}
-          className={`p-4 rounded-full transition-all ${micOn ? 'bg-slate-700 hover:bg-slate-600 text-white' : 'bg-red-500 text-white shadow-lg shadow-red-500/20'}`}
-        >
+        <button onClick={toggleMic} className={`p-4 rounded-full transition-all ${micOn ? 'bg-slate-700 hover:bg-slate-600 text-white' : 'bg-red-500 text-white'}`}>
           {micOn ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
         </button>
-        <button 
-          onClick={() => {
-             peerConnection.current?.close();
-             onBack();
-          }}
-          className="p-4 bg-red-600 hover:bg-red-500 text-white rounded-full shadow-lg shadow-red-600/30 px-8 flex items-center gap-2 font-bold"
-        >
-          <PhoneOff className="w-6 h-6" />
-          <span className="hidden md:inline">End Call</span>
+        <button onClick={() => { peerConnection.current?.close(); onBack(); }} className="p-4 bg-red-600 hover:bg-red-500 text-white rounded-full px-8 flex items-center gap-2 font-bold">
+          <PhoneOff className="w-6 h-6" /> <span className="hidden md:inline">End Call</span>
         </button>
-        <button 
-          onClick={toggleCam}
-          className={`p-4 rounded-full transition-all ${cameraOn ? 'bg-slate-700 hover:bg-slate-600 text-white' : 'bg-red-500 text-white shadow-lg shadow-red-500/20'}`}
-        >
+        <button onClick={toggleCam} className={`p-4 rounded-full transition-all ${cameraOn ? 'bg-slate-700 hover:bg-slate-600 text-white' : 'bg-red-500 text-white'}`}>
           {cameraOn ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
         </button>
       </div>
