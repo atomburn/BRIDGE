@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ConnectionState } from '../types';
-import { Copy, Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, Link as LinkIcon, AlertTriangle, Network } from 'lucide-react';
+import { Copy, Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, Link as LinkIcon, AlertTriangle, Network, Loader2 } from 'lucide-react';
 
 const SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
   ],
 };
 
@@ -18,6 +21,8 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [cameraOn, setCameraOn] = useState(true);
   const [copied, setCopied] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
+  const [mediaReady, setMediaReady] = useState(false);
+  const [mediaError, setMediaError] = useState<string>('');
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -30,35 +35,49 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         localStream.current = stream;
+        setMediaReady(true);
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = stream;
         }
       } catch (err) {
         console.error("Error accessing media:", err);
+        setMediaError("Could not access camera/microphone. Please check permissions.");
       }
     };
     startMedia();
 
     return () => {
-      localStream.current?.getTracks().forEach(track => track.stop());
-      peerConnection.current?.close();
+      // Cleanup tracks
+      if (localStream.current) {
+        localStream.current.getTracks().forEach(track => track.stop());
+      }
+      // Cleanup connection
+      if (peerConnection.current) {
+        peerConnection.current.close();
+      }
     };
   }, []);
 
   const createPeerConnection = () => {
+    // If a connection already exists, return it.
+    // NOTE: This prevents duplicate connections but we must ensure tracks are added.
     if (peerConnection.current) return peerConnection.current;
 
     const pc = new RTCPeerConnection(SERVERS);
 
-    // Add local tracks
+    // CRITICAL: Add local tracks immediately upon creation
+    // We rely on mediaReady state to prevent calling this function before stream exists
     if (localStream.current) {
       localStream.current.getTracks().forEach(track => {
         pc.addTrack(track, localStream.current!);
       });
+    } else {
+        console.warn("CreatePeerConnection called without local stream!");
     }
 
     // Handle remote tracks
     pc.ontrack = (event) => {
+      console.log("Remote track received", event.streams);
       if (remoteVideoRef.current && event.streams[0]) {
         remoteVideoRef.current.srcObject = event.streams[0];
       }
@@ -80,8 +99,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
         setIceStatus(pc.iceConnectionState);
     };
 
-    // ICE Candidate handling - simplified for "Serverless"
-    // We wait for gathering to complete to have a single blob to copy
+    // ICE Candidate handling
     pc.onicecandidate = (event) => {
       if (event.candidate === null) {
         // Gathering complete
@@ -98,16 +116,21 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   };
 
   const startAsHost = async () => {
+    if (!mediaReady) return; // Guard against race condition
     const pc = createPeerConnection();
     setConnectionState(ConnectionState.CREATING_OFFER);
     
-    const offer = await pc.createOffer();
+    // Explicitly creating offer with receive audio/video options helps compatibility
+    const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true
+    });
     await pc.setLocalDescription(offer);
-    // Code will be set in onicecandidate when null
   };
 
   const joinAsGuest = async () => {
-    const pc = createPeerConnection();
+    if (!mediaReady) return; // Guard against race condition
+    createPeerConnection(); // Initialize PC and add tracks
     setConnectionState(ConnectionState.PROCESSING_OFFER);
   };
 
@@ -124,9 +147,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         setConnectionState(ConnectionState.WAITING_FOR_ANSWER);
-        // Answer code generated in onicecandidate
       } else if (pc.remoteDescription?.type === 'answer') {
-        // Connection should establish
         setConnectionState(ConnectionState.CONNECTED);
       }
     } catch (e) {
@@ -148,16 +169,40 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   };
 
   const toggleMic = () => {
+    const newState = !micOn;
+    setMicOn(newState);
+
+    // 1. Update Local Stream (for UI state consistency)
     if (localStream.current) {
-      localStream.current.getAudioTracks().forEach(t => t.enabled = !micOn);
-      setMicOn(!micOn);
+      localStream.current.getAudioTracks().forEach(t => t.enabled = newState);
+    }
+
+    // 2. Update Active Connection Senders (Critical for ensuring remote side stops hearing)
+    if (peerConnection.current) {
+        peerConnection.current.getSenders().forEach(sender => {
+            if (sender.track && sender.track.kind === 'audio') {
+                sender.track.enabled = newState;
+            }
+        });
     }
   };
 
   const toggleCam = () => {
+    const newState = !cameraOn;
+    setCameraOn(newState);
+
+    // 1. Update Local Stream
     if (localStream.current) {
-      localStream.current.getVideoTracks().forEach(t => t.enabled = !cameraOn);
-      setCameraOn(!cameraOn);
+      localStream.current.getVideoTracks().forEach(t => t.enabled = newState);
+    }
+    
+    // 2. Update Active Connection Senders
+    if (peerConnection.current) {
+        peerConnection.current.getSenders().forEach(sender => {
+            if (sender.track && sender.track.kind === 'video') {
+                sender.track.enabled = newState;
+            }
+        });
     }
   };
 
@@ -224,19 +269,34 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
           )}
 
           {/* Local Video (Preview or PiP) */}
-          <div className={`${connectionState === ConnectionState.CONNECTED ? 'absolute bottom-4 right-4 w-32 h-48 md:w-48 md:h-72 shadow-2xl border-2 border-slate-700' : 'w-full max-w-md aspect-video shadow-xl border border-slate-700'} bg-black rounded-2xl overflow-hidden transition-all duration-500`}>
+          <div className={`${connectionState === ConnectionState.CONNECTED ? 'absolute bottom-4 right-4 w-32 h-48 md:w-48 md:h-72 shadow-2xl border-2 border-slate-700' : 'w-full max-w-md aspect-video shadow-xl border border-slate-700'} bg-black rounded-2xl overflow-hidden transition-all duration-500 relative`}>
              <video 
                 ref={localVideoRef} 
                 autoPlay 
                 playsInline 
                 muted 
-                className={`w-full h-full object-cover ${!cameraOn && 'opacity-0'}`} 
+                className={`w-full h-full object-cover transform scale-x-[-1] ${!cameraOn && 'opacity-0'}`} 
              />
              {!cameraOn && (
                <div className="absolute inset-0 flex items-center justify-center text-slate-500">
                  <VideoOff className="w-12 h-12" />
                </div>
              )}
+             
+             {!mediaReady && !mediaError && (
+                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/50 backdrop-blur-sm z-20">
+                    <Loader2 className="w-8 h-8 text-teal-500 animate-spin mb-2" />
+                    <p className="text-xs text-teal-400 font-medium">Initializing Camera...</p>
+                 </div>
+             )}
+             
+             {mediaError && (
+                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-900/80 p-4 text-center">
+                    <AlertTriangle className="w-8 h-8 text-white mb-2" />
+                    <p className="text-xs text-white">{mediaError}</p>
+                 </div>
+             )}
+
              <div className="absolute bottom-2 left-2 bg-black/50 px-2 py-0.5 rounded-full text-xs backdrop-blur-md">
                 You
              </div>
@@ -257,7 +317,8 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                   <div className="grid grid-cols-2 gap-4">
                     <button 
                       onClick={startAsHost}
-                      className="p-6 bg-slate-800 border border-slate-600 rounded-xl hover:bg-slate-700 hover:border-teal-500 transition-all group flex flex-col items-center gap-3"
+                      disabled={!mediaReady}
+                      className="p-6 bg-slate-800 border border-slate-600 rounded-xl hover:bg-slate-700 hover:border-teal-500 transition-all group flex flex-col items-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <div className="p-3 bg-teal-500/10 rounded-full group-hover:bg-teal-500/20 text-teal-400">
                          <Smartphone className="w-8 h-8" />
@@ -266,7 +327,8 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                     </button>
                     <button 
                       onClick={joinAsGuest}
-                      className="p-6 bg-slate-800 border border-slate-600 rounded-xl hover:bg-slate-700 hover:border-blue-500 transition-all group flex flex-col items-center gap-3"
+                      disabled={!mediaReady}
+                      className="p-6 bg-slate-800 border border-slate-600 rounded-xl hover:bg-slate-700 hover:border-blue-500 transition-all group flex flex-col items-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                        <div className="p-3 bg-blue-500/10 rounded-full group-hover:bg-blue-500/20 text-blue-400">
                          <Check className="w-8 h-8" />
@@ -274,6 +336,9 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                       <span className="font-semibold">I Have a Code</span>
                     </button>
                   </div>
+                  {!mediaReady && !mediaError && (
+                      <p className="text-xs text-yellow-500 animate-pulse">Waiting for camera access...</p>
+                  )}
                 </div>
               )}
 
