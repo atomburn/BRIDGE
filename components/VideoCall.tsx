@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ConnectionState } from '../types';
-import { Copy, Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, Link as LinkIcon, AlertTriangle, Network, Loader2, Info } from 'lucide-react';
+import { Check, Video, Mic, MicOff, VideoOff, PhoneOff, ArrowLeft, RefreshCw, Smartphone, Link as LinkIcon, AlertTriangle, Network, Loader2, Info } from 'lucide-react';
 
 // Extensive list of free public STUN servers to help punch through VPNs/NATs
 const SERVERS = {
@@ -33,7 +33,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [debugStats, setDebugStats] = useState<string>('Waiting for data...');
   const [showStats, setShowStats] = useState(false);
   
-  // State to hold the remote stream
+  // State to hold the remote stream for UI purposes
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -79,13 +79,9 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       statsInterval.current = window.setInterval(async () => {
         if (!peerConnection.current) return;
         const stats = await peerConnection.current.getStats();
-        let activeCandidate = '';
         let bytesReceived = 0;
         
         stats.forEach(report => {
-           if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-              activeCandidate = `Pair: ${report.localCandidateId} <-> ${report.remoteCandidateId}`;
-           }
            if (report.type === 'inbound-rtp' && (report.kind === 'video' || report.mediaType === 'video')) {
               bytesReceived = report.bytesReceived;
            }
@@ -95,15 +91,6 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       }, 2000);
     }
   }, [connectionState]);
-
-  // Handle attaching remote stream safely
-  useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      console.log("Updating remote video element source", remoteStream.getTracks());
-      remoteVideoRef.current.srcObject = remoteStream;
-      remoteVideoRef.current.play().catch(e => console.error("Auto-play error", e));
-    }
-  }, [remoteStream, connectionState]);
 
   const createPeerConnection = () => {
     if (peerConnection.current) return peerConnection.current;
@@ -122,32 +109,20 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       });
     }
 
-    // CRITICAL FIX: Robust Track Handling
-    // Instead of replacing the stream, we make sure we are adding to the existing one if needed
+    // CRITICAL FIX: Direct DOM Attachment
     pc.ontrack = (event) => {
       console.log("REMOTE TRACK ARRIVED:", event.track.kind, event.streams);
       
-      // Use the browser-provided stream if available (most reliable)
-      if (event.streams && event.streams[0]) {
-        const stream = event.streams[0];
-        
-        // Listen for future tracks adding to this stream (e.g. video comes 1s after audio)
-        stream.onaddtrack = () => {
-           console.log("Track added to existing remote stream");
-           // Force React update by creating a shallow copy/new reference if needed
-           // But usually just re-setting state is enough
-           setRemoteStream(stream); 
-        };
-
-        setRemoteStream(stream);
-      } else {
-        // Fallback: Manually build stream (rarely needed in modern browsers but good for safety)
-        setRemoteStream(prev => {
-           const newStream = prev ? prev : new MediaStream();
-           newStream.addTrack(event.track);
-           return newStream;
-        });
+      const stream = event.streams[0] || new MediaStream([event.track]);
+      
+      // 1. Direct DOM update (Fastest, bypasses React render cycle)
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = stream;
+        remoteVideoRef.current.play().catch(e => console.error("Autoplay error:", e));
       }
+
+      // 2. State update (For UI visibility toggles)
+      setRemoteStream(stream);
     };
 
     pc.onconnectionstatechange = () => {
@@ -231,7 +206,7 @@ const VideoCall: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     setTimeout(() => setLinkCopied(false), 2000);
   };
 
-  // CRITICAL FIX: Toggle Media Tracks on BOTH local preview AND network sender
+  // Toggle Media Tracks on BOTH local preview AND network sender
   const toggleMic = () => {
     const newState = !micOn;
     setMicOn(newState);
